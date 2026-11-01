@@ -6,6 +6,7 @@ import {
   Menu, ArrowRight
 } from 'lucide-react'
 
+// Sample game data
 const games = [
   {
     id: 1,
