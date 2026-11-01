@@ -1,0 +1,72 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+
+@import "tailwindcss";
+
+:root {
+  font-family: 'Inter', sans-serif;
+  color: #F0F0ED;
+  background: #101114;
+
+  --gv-bg: #101114;
+  --gv-surface: #191B20;
+  --gv-text: #F0F0ED;
+  --gv-muted: #A7A9B0;
+  --gv-accent: #D7FF64;
+  --gv-border: #303239;
+
+  --gv-radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--gv-bg);
+  color: var(--gv-text);
+  font-family: 'Inter', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Manrope', sans-serif;
+  letter-spacing: -0.035em;
+}
+
+button, a {
+  cursor: pointer;
+}
+
+button {
+  font-family: inherit;
+  transition: color 180ms ease, background-color 180ms ease,
+    border-color 180ms ease, transform 180ms ease;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+::selection {
+  background: var(--gv-accent);
+  color: #101114;
+}
+
+:focus-visible {
+  outline: 2px solid var(--gv-accent);
+  outline-offset: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
