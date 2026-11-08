@@ -1,26 +1,38 @@
 
 import { useState, useEffect } from 'react'
 import {
-  Search, Gamepad2, Play, Star, CalendarDays,
-  Clock3, X, ChevronRight, ArrowUpRight,
-  Menu, ArrowRight
+  Search, Gamepad2, Play, Star, X, ChevronRight,
+  ArrowUpRight, Menu, ArrowRight, RefreshCw,
+  CheckCircle2, AlertCircle, Loader2
 } from 'lucide-react'
 
 // --------------------------------------------------
-// Date helpers
+// Constants and helpers
 // --------------------------------------------------
+
+const API_URL = 'http://localhost:3001'
+
+const STEAM_GENRES = [
+  'Action',
+  'Adventure',
+  'Strategy',
+  'RPG',
+  'Indie',
+  'Massively Multiplayer',
+  'Casual',
+  'Simulation',
+  'Racing',
+  'Sports'
+]
 
 function parseDate(date) {
   if (!date) return null
-
   const timestamp = Date.parse(date)
-
   return Number.isNaN(timestamp) ? null : timestamp
 }
 
 function countdown(date, tick) {
   const timestamp = parseDate(date)
-
   if (!timestamp) return 'Date TBA'
 
   const releaseDay = new Date(timestamp)
@@ -49,17 +61,56 @@ function formatDate(date) {
   })
 }
 
+function normalizeGame(game) {
+  let genres = []
+  let platforms = []
+
+  try {
+    genres = Array.isArray(game.genres)
+      ? game.genres
+      : JSON.parse(game.genres || '[]')
+  } catch {
+    genres = []
+  }
+
+  try {
+    platforms = Array.isArray(game.platforms)
+      ? game.platforms
+      : JSON.parse(game.platforms || '[]')
+  } catch {
+    platforms = []
+  }
+
+  return {
+    id: game.appid,
+    appid: game.appid,
+    title: game.title || 'Untitled game',
+    genre: genres[0] || 'Uncategorized',
+    genres,
+    platforms: platforms.map((item) =>
+      item === 'Windows' ? 'PC' : item
+    ),
+    date: game.release_date || '',
+    score: game.metacritic_score,
+    developer: game.developer || 'Unknown developer',
+    publisher: game.publisher || '',
+    description: game.description || 'No description available.',
+    image: game.image || '',
+    website: game.website || ''
+  }
+}
+
 // --------------------------------------------------
 // Main application
 // --------------------------------------------------
 
 function App() {
-  // Game data from the GameVault backend
+  // Game data
   const [games, setGames] = useState([])
   const [loading, setLoading] = useState(true)
   const [apiError, setApiError] = useState('')
 
-  // UI state
+  // Main UI
   const [selected, setSelected] = useState(null)
   const [search, setSearch] = useState('')
   const [genre, setGenre] = useState('All Games')
@@ -69,84 +120,55 @@ function App() {
   const [tick, setTick] = useState(Date.now())
   const [mobileMenu, setMobileMenu] = useState(false)
 
+  // Steam discovery
+  const [discoveryGenres, setDiscoveryGenres] = useState([
+    'Action',
+    'Adventure'
+  ])
+  const [discoveryLimit, setDiscoveryLimit] = useState(5)
+  const [discovering, setDiscovering] = useState(false)
+  const [discoveryResult, setDiscoveryResult] = useState(null)
+  const [discoveryError, setDiscoveryError] = useState('')
+
   // ------------------------------------------------
   // Fetch games from backend
   // ------------------------------------------------
 
+  async function loadGames() {
+    const response = await fetch(`${API_URL}/api/games`)
+
+    if (!response.ok) {
+      throw new Error('Could not load games from GameVault API.')
+    }
+
+    const result = await response.json()
+
+    if (!Array.isArray(result.games)) {
+      throw new Error('Invalid response from GameVault API.')
+    }
+
+    const normalizedGames = result.games.map(normalizeGame)
+
+    setGames(normalizedGames)
+    setApiError('')
+
+    return normalizedGames
+  }
+
   useEffect(() => {
-    async function loadGames() {
+    async function initialize() {
       try {
         setLoading(true)
-        setApiError('')
-
-        const response = await fetch(
-          'http://localhost:3001/api/games'
-        )
-
-        if (!response.ok) {
-          throw new Error(
-            'Could not load games from GameVault API.'
-          )
-        }
-
-        const result = await response.json()
-
-        if (!Array.isArray(result.games)) {
-          throw new Error('Invalid response from GameVault API.')
-        }
-
-        const normalizedGames = result.games.map((game) => {
-          let gameGenres = []
-          let gamePlatforms = []
-
-          try {
-            gameGenres = JSON.parse(game.genres || '[]')
-          } catch {
-            gameGenres = []
-          }
-
-          try {
-            gamePlatforms = JSON.parse(game.platforms || '[]')
-          } catch {
-            gamePlatforms = []
-          }
-
-          // Convert Steam platform names for the UI
-          const normalizedPlatforms = gamePlatforms.map((item) => {
-            if (item === 'Windows') return 'PC'
-            return item
-          })
-
-          return {
-            id: game.appid,
-            appid: game.appid,
-            title: game.title || 'Untitled game',
-            genre: gameGenres[0] || 'Uncategorized',
-            genres: gameGenres,
-            platforms: normalizedPlatforms,
-            date: game.release_date || '',
-            score: game.metacritic_score,
-            developer: game.developer || 'Unknown developer',
-            publisher: game.publisher || '',
-            description: game.description || 'No description available.',
-            image: game.image || '',
-            website: game.website || ''
-          }
-        })
-
-        setGames(normalizedGames)
+        await loadGames()
       } catch (error) {
         console.error('GameVault API error:', error)
-
-        setApiError(
-          error.message || 'Could not connect to GameVault API.'
-        )
+        setApiError(error.message || 'Could not connect to GameVault API.')
       } finally {
         setLoading(false)
       }
     }
 
-    loadGames()
+    initialize()
   }, [])
 
   // ------------------------------------------------
@@ -176,10 +198,60 @@ function App() {
 
     window.addEventListener('keydown', handleKey)
 
-    return () => {
-      window.removeEventListener('keydown', handleKey)
-    }
+    return () => window.removeEventListener('keydown', handleKey)
   }, [])
+
+  // ------------------------------------------------
+  // Steam discovery actions
+  // ------------------------------------------------
+
+  const toggleDiscoveryGenre = (selectedGenre) => {
+    setDiscoveryGenres((current) =>
+      current.includes(selectedGenre)
+        ? current.filter((item) => item !== selectedGenre)
+        : [...current, selectedGenre]
+    )
+  }
+
+  const discoverGames = async () => {
+    if (discoveryGenres.length === 0 || discovering) return
+
+    setDiscovering(true)
+    setDiscoveryError('')
+    setDiscoveryResult(null)
+
+    try {
+      const params = new URLSearchParams({
+        genres: discoveryGenres.join(','),
+        limit: String(discoveryLimit)
+      })
+
+      const response = await fetch(
+        `${API_URL}/api/import/discover?${params.toString()}`,
+        { method: 'POST' }
+      )
+
+      const result = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          result.details || result.error || 'Steam discovery failed.'
+        )
+      }
+
+      setDiscoveryResult(result)
+
+      // Reload the homepage catalogue after importing
+      await loadGames()
+    } catch (error) {
+      console.error('Steam discovery error:', error)
+      setDiscoveryError(
+        error.message || 'Could not complete Steam discovery.'
+      )
+    } finally {
+      setDiscovering(false)
+    }
+  }
 
   // ------------------------------------------------
   // Dynamic filters
@@ -218,7 +290,8 @@ function App() {
     .filter((game) => {
       const timestamp = parseDate(game.date)
 
-      return !timestamp || timestamp >= new Date(tick).setHours(0, 0, 0, 0)
+      return !timestamp ||
+        timestamp >= new Date(tick).setHours(0, 0, 0, 0)
     })
     .sort((a, b) => {
       const dateA = parseDate(a.date)
@@ -274,13 +347,26 @@ function App() {
           <h1 className="font-[Manrope] text-2xl font-extrabold">
             GAME<span className="text-[#D7FF64]">VAULT</span>
           </h1>
-          <p className="mt-4 text-sm text-red-400">
-            {apiError}
-          </p>
+          <p className="mt-4 text-sm text-red-400">{apiError}</p>
           <p className="mt-3 text-xs leading-6 text-[#A7A9B0]">
             Make sure the GameVault backend is running on port 3001,
             then refresh this page.
           </p>
+          <button
+            onClick={async () => {
+              try {
+                setLoading(true)
+                await loadGames()
+              } catch (error) {
+                setApiError(error.message)
+              } finally {
+                setLoading(false)
+              }
+            }}
+            className="mt-6 bg-[#D7FF64] px-6 py-3 text-sm font-bold text-[#101114]"
+          >
+            Try again
+          </button>
         </div>
       </div>
     )
@@ -322,6 +408,7 @@ function App() {
 
           <div className="hidden items-center gap-9 text-sm font-medium text-[#A7A9B0] md:flex">
             <a href="#discover" className="transition hover:text-[#D7FF64]">Discover</a>
+            <a href="#steam-discovery" className="transition hover:text-[#D7FF64]">Steam discovery</a>
             <a href="#upcoming" className="transition hover:text-[#D7FF64]">Release calendar</a>
             <a href="#about" className="transition hover:text-[#D7FF64]">About</a>
           </div>
@@ -346,6 +433,7 @@ function App() {
           <div className="border-t border-[#303239] px-5 py-5 md:hidden">
             <div className="flex flex-col gap-5 text-sm text-[#A7A9B0]">
               <a href="#discover" onClick={() => setMobileMenu(false)}>Discover</a>
+              <a href="#steam-discovery" onClick={() => setMobileMenu(false)}>Steam discovery</a>
               <a href="#upcoming" onClick={() => setMobileMenu(false)}>Release calendar</a>
               <a href="#about" onClick={() => setMobileMenu(false)}>About</a>
             </div>
@@ -463,6 +551,208 @@ function App() {
           </div>
         </section>
 
+        {/* Steam discovery */}
+        <section id="steam-discovery" className="border-b border-[#303239]">
+          <div className="mx-auto max-w-[1440px] px-5 py-16 md:px-10 md:py-20">
+
+            <div className="grid gap-10 lg:grid-cols-[0.85fr_1.15fr]">
+
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#D7FF64]">
+                  Powered by Steam
+                </p>
+
+                <h2 className="mt-3 font-[Manrope] text-3xl font-extrabold tracking-tight md:text-4xl">
+                  Discover something new.
+                </h2>
+
+                <p className="mt-4 max-w-lg text-sm leading-7 text-[#A7A9B0]">
+                  Search Steam's game categories and bring new discoveries
+                  directly into the GameVault collection.
+                </p>
+
+                <div className="mt-8 flex items-center gap-3 text-xs text-[#A7A9B0]">
+                  <span className="h-2 w-2 rounded-full bg-[#D7FF64]" />
+                  Connected to your GameVault database
+                </div>
+              </div>
+
+              <div className="border border-[#303239] bg-[#191B20] p-5 sm:p-7">
+
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h3 className="font-[Manrope] text-lg font-bold">
+                    Discovery settings
+                  </h3>
+
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#A7A9B0]">
+                    Steam catalogue
+                  </span>
+                </div>
+
+                <div className="mt-7">
+                  <p className="mb-4 text-xs font-bold uppercase tracking-wider text-[#A7A9B0]">
+                    Select genres
+                  </p>
+
+                  <div className="flex flex-wrap gap-2">
+                    {STEAM_GENRES.map((item) => {
+                      const active = discoveryGenres.includes(item)
+
+                      return (
+                        <button
+                          key={item}
+                          onClick={() => toggleDiscoveryGenre(item)}
+                          disabled={discovering}
+                          className={`border px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                            active
+                              ? 'border-[#D7FF64] bg-[#D7FF64] text-[#101114]'
+                              : 'border-[#45474E] text-[#A7A9B0] hover:border-[#D7FF64] hover:text-[#D7FF64]'
+                          }`}
+                        >
+                          {item}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  <p className="mt-3 text-xs text-[#777A83]">
+                    {discoveryGenres.length} genre(s) selected
+                  </p>
+                </div>
+
+                <div className="mt-7 border-t border-[#303239] pt-6">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm font-bold">Games per category</p>
+                      <p className="mt-1 text-xs text-[#A7A9B0]">
+                        Upcoming and recently released games
+                      </p>
+                    </div>
+
+                    <select
+                      value={discoveryLimit}
+                      onChange={(e) => setDiscoveryLimit(Number(e.target.value))}
+                      disabled={discovering}
+                      className="border border-[#45474E] bg-[#101114] px-4 py-3 text-sm text-[#F0F0ED] outline-none focus:border-[#D7FF64] disabled:opacity-50"
+                    >
+                      <option value={1}>1 game</option>
+                      <option value={3}>3 games</option>
+                      <option value={5}>5 games</option>
+                      <option value={10}>10 games</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button
+                  onClick={discoverGames}
+                  disabled={discovering || discoveryGenres.length === 0}
+                  className="mt-7 flex w-full items-center justify-center gap-3 bg-[#D7FF64] px-6 py-4 text-sm font-extrabold text-[#101114] transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {discovering ? (
+                    <>
+                      <Loader2 size={18} className="animate-spin" />
+                      Discovering games...
+                    </>
+                  ) : (
+                    <>
+                      <Search size={18} />
+                      Discover games on Steam
+                      <ArrowUpRight size={17} />
+                    </>
+                  )}
+                </button>
+
+                {discoveryGenres.length === 0 && (
+                  <p className="mt-3 text-xs text-amber-400">
+                    Select at least one genre to continue.
+                  </p>
+                )}
+
+                {discovering && (
+                  <p className="mt-4 text-center text-xs text-[#A7A9B0]">
+                    Fetching game details and updating your database.
+                    This may take a little while.
+                  </p>
+                )}
+
+                {discoveryError && (
+                  <div className="mt-6 flex gap-3 border border-red-500/30 bg-red-500/5 p-4">
+                    <AlertCircle className="shrink-0 text-red-400" size={19} />
+                    <div>
+                      <p className="text-sm font-bold text-red-400">
+                        Discovery failed
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-[#A7A9B0]">
+                        {discoveryError}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {discoveryResult && (
+                  <div className="mt-6 border border-[#D7FF64]/30 bg-[#D7FF64]/5 p-5">
+                    <div className="flex items-center gap-3">
+                      <CheckCircle2 className="text-[#D7FF64]" size={21} />
+                      <p className="font-[Manrope] text-sm font-bold">
+                        Discovery completed
+                      </p>
+                    </div>
+
+                    <div className="mt-5 grid grid-cols-2 gap-4 sm:grid-cols-4">
+                      <div>
+                        <p className="font-[Manrope] text-2xl font-extrabold tabular-nums">
+                          {discoveryResult.discovered ?? 0}
+                        </p>
+                        <p className="mt-1 text-[10px] uppercase tracking-wider text-[#A7A9B0]">
+                          Discovered
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="font-[Manrope] text-2xl font-extrabold tabular-nums text-[#D7FF64]">
+                          {discoveryResult.imported ?? 0}
+                        </p>
+                        <p className="mt-1 text-[10px] uppercase tracking-wider text-[#A7A9B0]">
+                          Imported
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="font-[Manrope] text-2xl font-extrabold tabular-nums">
+                          {discoveryResult.skipped ?? 0}
+                        </p>
+                        <p className="mt-1 text-[10px] uppercase tracking-wider text-[#A7A9B0]">
+                          Skipped
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="font-[Manrope] text-2xl font-extrabold tabular-nums">
+                          {discoveryResult.failed ?? 0}
+                        </p>
+                        <p className="mt-1 text-[10px] uppercase tracking-wider text-[#A7A9B0]">
+                          Failed
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 border-t border-[#45474E] pt-4">
+                      <p className="text-xs text-[#A7A9B0]">
+                        Your GameVault catalogue has been refreshed.
+                        Current collection:
+                        <span className="ml-1 font-bold text-[#F0F0ED]">
+                          {games.length} games
+                        </span>
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+              </div>
+            </div>
+          </div>
+        </section>
+
         {/* Upcoming releases */}
         <section id="upcoming" className="mx-auto max-w-[1440px] px-5 py-16 md:px-10 md:py-20">
 
@@ -496,11 +786,7 @@ function App() {
                 </span>
 
                 {game.image ? (
-                  <img
-                    src={game.image}
-                    alt=""
-                    className="h-14 w-16 object-cover sm:h-16 sm:w-24"
-                  />
+                  <img src={game.image} alt="" className="h-14 w-16 object-cover sm:h-16 sm:w-24" />
                 ) : (
                   <div className="flex h-14 w-16 items-center justify-center bg-[#191B20] sm:h-16 sm:w-24">
                     <Gamepad2 size={23} className="text-[#777A83]" />
@@ -540,9 +826,8 @@ function App() {
           </div>
         </section>
 
-        {/* Game discovery */}
+        {/* Game collection */}
         <section id="discover" className="border-t border-[#303239] bg-[#191B20]">
-
           <div className="mx-auto max-w-[1440px] px-5 py-16 md:px-10 md:py-20">
 
             <div className="mb-10">
@@ -559,9 +844,8 @@ function App() {
               </p>
             </div>
 
-            {/* Search and filters */}
+            {/* Search */}
             <div className="mb-8 flex flex-col gap-6">
-
               <div className="relative max-w-lg">
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-[#A7A9B0]" size={19} />
                 <input
@@ -611,7 +895,6 @@ function App() {
                   </button>
                 ))}
               </div>
-
             </div>
 
             <div className="mb-5 flex items-center justify-between border-b border-[#45474E] pb-4">
@@ -625,10 +908,8 @@ function App() {
 
             {/* Game grid */}
             <div className="grid gap-x-6 gap-y-10 sm:grid-cols-2 lg:grid-cols-3">
-
               {filtered.map((game) => (
                 <article key={game.id} className="group">
-
                   <button
                     onClick={() => openGame(game)}
                     className="relative block aspect-[16/10] w-full overflow-hidden bg-[#101114] text-left"
@@ -692,10 +973,8 @@ function App() {
                       </button>
                     </div>
                   </div>
-
                 </article>
               ))}
-
             </div>
 
             {filtered.length === 0 && (
