@@ -1,32 +1,65 @@
 
 import { useState, useEffect } from 'react'
-import { games } from './data/games.js'
 import {
   Search, Gamepad2, Play, Star, CalendarDays,
   Clock3, X, ChevronRight, ArrowUpRight,
   Menu, ArrowRight
 } from 'lucide-react'
 
-const genres = ['All Games', 'Action', 'Adventure', 'Puzzle', 'RPG']
-const platforms = ['All', 'PC', 'PS5', 'Switch', 'Xbox']
+// --------------------------------------------------
+// Date helpers
+// --------------------------------------------------
+
+function parseDate(date) {
+  if (!date) return null
+
+  const timestamp = Date.parse(date)
+
+  return Number.isNaN(timestamp) ? null : timestamp
+}
 
 function countdown(date, tick) {
-  const diff = new Date(date + 'T00:00:00').getTime() - tick
+  const timestamp = parseDate(date)
 
-  if (diff <= 0) return 'Released'
+  if (!timestamp) return 'Date TBA'
+
+  const releaseDay = new Date(timestamp)
+  releaseDay.setHours(0, 0, 0, 0)
+
+  const today = new Date(tick)
+  today.setHours(0, 0, 0, 0)
+
+  const diff = releaseDay.getTime() - today.getTime()
+
+  if (diff < 0) return 'Released'
+  if (diff === 0) return 'Releases today'
 
   return `${Math.ceil(diff / 86400000)} days remaining`
 }
 
 function formatDate(date) {
-  return new Date(date + 'T00:00:00').toLocaleDateString('en-US', {
+  const timestamp = parseDate(date)
+
+  if (!timestamp) return date || 'Date TBA'
+
+  return new Date(timestamp).toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
     year: 'numeric'
   })
 }
 
+// --------------------------------------------------
+// Main application
+// --------------------------------------------------
+
 function App() {
+  // Game data from the GameVault backend
+  const [games, setGames] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [apiError, setApiError] = useState('')
+
+  // UI state
   const [selected, setSelected] = useState(null)
   const [search, setSearch] = useState('')
   const [genre, setGenre] = useState('All Games')
@@ -36,10 +69,101 @@ function App() {
   const [tick, setTick] = useState(Date.now())
   const [mobileMenu, setMobileMenu] = useState(false)
 
+  // ------------------------------------------------
+  // Fetch games from backend
+  // ------------------------------------------------
+
   useEffect(() => {
-    const timer = setInterval(() => setTick(Date.now()), 60000)
+    async function loadGames() {
+      try {
+        setLoading(true)
+        setApiError('')
+
+        const response = await fetch(
+          'http://localhost:3001/api/games'
+        )
+
+        if (!response.ok) {
+          throw new Error(
+            'Could not load games from GameVault API.'
+          )
+        }
+
+        const result = await response.json()
+
+        if (!Array.isArray(result.games)) {
+          throw new Error('Invalid response from GameVault API.')
+        }
+
+        const normalizedGames = result.games.map((game) => {
+          let gameGenres = []
+          let gamePlatforms = []
+
+          try {
+            gameGenres = JSON.parse(game.genres || '[]')
+          } catch {
+            gameGenres = []
+          }
+
+          try {
+            gamePlatforms = JSON.parse(game.platforms || '[]')
+          } catch {
+            gamePlatforms = []
+          }
+
+          // Convert Steam platform names for the UI
+          const normalizedPlatforms = gamePlatforms.map((item) => {
+            if (item === 'Windows') return 'PC'
+            return item
+          })
+
+          return {
+            id: game.appid,
+            appid: game.appid,
+            title: game.title || 'Untitled game',
+            genre: gameGenres[0] || 'Uncategorized',
+            genres: gameGenres,
+            platforms: normalizedPlatforms,
+            date: game.release_date || '',
+            score: game.metacritic_score,
+            developer: game.developer || 'Unknown developer',
+            publisher: game.publisher || '',
+            description: game.description || 'No description available.',
+            image: game.image || '',
+            website: game.website || ''
+          }
+        })
+
+        setGames(normalizedGames)
+      } catch (error) {
+        console.error('GameVault API error:', error)
+
+        setApiError(
+          error.message || 'Could not connect to GameVault API.'
+        )
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    loadGames()
+  }, [])
+
+  // ------------------------------------------------
+  // Countdown clock
+  // ------------------------------------------------
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTick(Date.now())
+    }, 60000)
+
     return () => clearInterval(timer)
   }, [])
+
+  // ------------------------------------------------
+  // Keyboard controls
+  // ------------------------------------------------
 
   useEffect(() => {
     const handleKey = (event) => {
@@ -51,22 +175,65 @@ function App() {
     }
 
     window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
+
+    return () => {
+      window.removeEventListener('keydown', handleKey)
+    }
   }, [])
 
-  const filtered = games.filter(game =>
-    (genre === 'All Games' || game.genre === genre) &&
-    (platform === 'All' || game.platforms.includes(platform)) &&
-    game.title.toLowerCase().includes(search.toLowerCase())
-  )
+  // ------------------------------------------------
+  // Dynamic filters
+  // ------------------------------------------------
+
+  const availableGenres = [
+    ...new Set(games.flatMap((game) => game.genres))
+  ].sort()
+
+  const availablePlatforms = [
+    ...new Set(games.flatMap((game) => game.platforms))
+  ].sort()
+
+  // ------------------------------------------------
+  // Search and filtering
+  // ------------------------------------------------
+
+  const filtered = games.filter((game) => {
+    const matchesGenre =
+      genre === 'All Games' || game.genres.includes(genre)
+
+    const matchesPlatform =
+      platform === 'All' || game.platforms.includes(platform)
+
+    const matchesSearch =
+      game.title.toLowerCase().includes(search.toLowerCase())
+
+    return matchesGenre && matchesPlatform && matchesSearch
+  })
+
+  // ------------------------------------------------
+  // Upcoming releases
+  // ------------------------------------------------
 
   const upcoming = [...games]
-    .filter(game => new Date(game.date + 'T23:59:59').getTime() > tick)
-    .sort((a, b) => new Date(a.date) - new Date(b.date))
+    .filter((game) => {
+      const timestamp = parseDate(game.date)
 
-  const communityScore = selected
-    ? Math.round((selected.score + review) / 2)
-    : 0
+      return !timestamp || timestamp >= new Date(tick).setHours(0, 0, 0, 0)
+    })
+    .sort((a, b) => {
+      const dateA = parseDate(a.date)
+      const dateB = parseDate(b.date)
+
+      if (!dateA && !dateB) return 0
+      if (!dateA) return 1
+      if (!dateB) return -1
+
+      return dateA - dateB
+    })
+
+  // ------------------------------------------------
+  // Game interactions
+  // ------------------------------------------------
 
   const openGame = (game, showTrailer = false) => {
     setSelected(game)
@@ -78,6 +245,64 @@ function App() {
     setSelected(null)
     setTrailer(false)
   }
+
+  // ------------------------------------------------
+  // Loading and error screens
+  // ------------------------------------------------
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#101114] text-[#F0F0ED]">
+        <div className="text-center">
+          <Gamepad2 className="mx-auto mb-5 text-[#D7FF64]" size={42} />
+          <h1 className="font-[Manrope] text-2xl font-extrabold">
+            GAME<span className="text-[#D7FF64]">VAULT</span>
+          </h1>
+          <p className="mt-3 text-sm text-[#A7A9B0]">
+            Loading your game collection...
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (apiError) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#101114] px-5 text-[#F0F0ED]">
+        <div className="max-w-md text-center">
+          <Gamepad2 className="mx-auto mb-5 text-[#D7FF64]" size={42} />
+          <h1 className="font-[Manrope] text-2xl font-extrabold">
+            GAME<span className="text-[#D7FF64]">VAULT</span>
+          </h1>
+          <p className="mt-4 text-sm text-red-400">
+            {apiError}
+          </p>
+          <p className="mt-3 text-xs leading-6 text-[#A7A9B0]">
+            Make sure the GameVault backend is running on port 3001,
+            then refresh this page.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (games.length === 0) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#101114] px-5 text-center text-[#F0F0ED]">
+        <div>
+          <Gamepad2 className="mx-auto mb-5 text-[#D7FF64]" size={42} />
+          <h1 className="font-[Manrope] text-2xl font-extrabold">
+            GAME<span className="text-[#D7FF64]">VAULT</span>
+          </h1>
+          <p className="mt-4 text-sm text-[#A7A9B0]">
+            No games found. Import some games to get started.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  const featuredGame = games[0]
 
   return (
     <div className="min-h-screen bg-[#101114] text-[#F0F0ED]">
@@ -170,15 +395,23 @@ function App() {
 
                 <div className="mt-14 flex flex-wrap gap-10 border-t border-[#303239] pt-7">
                   <div>
-                    <p className="font-[Manrope] text-3xl font-extrabold tabular-nums">06</p>
+                    <p className="font-[Manrope] text-3xl font-extrabold tabular-nums">
+                      {String(games.length).padStart(2, '0')}
+                    </p>
                     <p className="mt-1 text-xs text-[#A7A9B0]">Games featured</p>
                   </div>
+
                   <div>
-                    <p className="font-[Manrope] text-3xl font-extrabold tabular-nums">04</p>
+                    <p className="font-[Manrope] text-3xl font-extrabold tabular-nums">
+                      {String(availableGenres.length).padStart(2, '0')}
+                    </p>
                     <p className="mt-1 text-xs text-[#A7A9B0]">Genres explored</p>
                   </div>
+
                   <div>
-                    <p className="font-[Manrope] text-3xl font-extrabold tabular-nums">05</p>
+                    <p className="font-[Manrope] text-3xl font-extrabold tabular-nums">
+                      {String(availablePlatforms.length).padStart(2, '0')}
+                    </p>
                     <p className="mt-1 text-xs text-[#A7A9B0]">Platform tags</p>
                   </div>
                 </div>
@@ -186,14 +419,20 @@ function App() {
 
               {/* Featured game */}
               <button
-                onClick={() => openGame(games[0])}
+                onClick={() => openGame(featuredGame)}
                 className="group relative min-h-[360px] overflow-hidden bg-[#191B20] text-left sm:min-h-[470px]"
               >
-                <img
-                  src={games[0].image}
-                  alt={games[0].title}
-                  className="absolute inset-0 h-full w-full object-cover transition duration-700 group-hover:scale-[1.04]"
-                />
+                {featuredGame.image ? (
+                  <img
+                    src={featuredGame.image}
+                    alt={featuredGame.title}
+                    className="absolute inset-0 h-full w-full object-cover transition duration-700 group-hover:scale-[1.04]"
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center bg-[#252830]">
+                    <Gamepad2 size={64} className="text-[#777A83]" />
+                  </div>
+                )}
 
                 <div className="absolute inset-0 bg-gradient-to-t from-black via-black/25 to-transparent" />
 
@@ -203,15 +442,15 @@ function App() {
 
                 <div className="absolute bottom-0 left-0 right-0 p-6 sm:p-9">
                   <p className="mb-3 text-xs font-semibold uppercase tracking-[0.2em] text-[#D7FF64]">
-                    Featured game / Adventure
+                    Featured game / {featuredGame.genre}
                   </p>
 
                   <h2 className="max-w-xl font-[Manrope] text-3xl font-extrabold leading-tight tracking-tight sm:text-4xl">
-                    Hollow Knight: Silksong
+                    {featuredGame.title}
                   </h2>
 
                   <p className="mt-3 max-w-md text-sm leading-6 text-white/75">
-                    Adventure awaits beyond the unknown.
+                    {featuredGame.description}
                   </p>
 
                   <span className="mt-6 inline-flex items-center gap-2 text-sm font-bold text-[#D7FF64]">
@@ -253,14 +492,20 @@ function App() {
                 className="group grid w-full grid-cols-[42px_64px_1fr_auto] items-center gap-4 border-b border-[#303239] py-5 text-left transition hover:bg-[#191B20] sm:grid-cols-[50px_90px_1fr_auto_auto] sm:gap-6 sm:px-4"
               >
                 <span className="font-[Manrope] text-sm font-bold tabular-nums text-[#777A83]">
-                  0{index + 1}
+                  {String(index + 1).padStart(2, '0')}
                 </span>
 
-                <img
-                  src={game.image}
-                  alt=""
-                  className="h-14 w-16 object-cover sm:h-16 sm:w-24"
-                />
+                {game.image ? (
+                  <img
+                    src={game.image}
+                    alt=""
+                    className="h-14 w-16 object-cover sm:h-16 sm:w-24"
+                  />
+                ) : (
+                  <div className="flex h-14 w-16 items-center justify-center bg-[#191B20] sm:h-16 sm:w-24">
+                    <Gamepad2 size={23} className="text-[#777A83]" />
+                  </div>
+                )}
 
                 <div className="min-w-0">
                   <h3 className="truncate font-[Manrope] text-sm font-bold sm:text-base">
@@ -275,13 +520,23 @@ function App() {
                 </div>
 
                 <div className="hidden text-right sm:block">
-                  <p className="text-sm font-semibold tabular-nums">{formatDate(game.date)}</p>
-                  <p className="mt-1 text-xs text-[#A7A9B0]">{countdown(game.date, tick)}</p>
+                  <p className="text-sm font-semibold tabular-nums">
+                    {formatDate(game.date)}
+                  </p>
+                  <p className="mt-1 text-xs text-[#A7A9B0]">
+                    {countdown(game.date, tick)}
+                  </p>
                 </div>
 
                 <ChevronRight className="text-[#777A83] transition group-hover:translate-x-1 group-hover:text-[#D7FF64]" size={20} />
               </button>
             ))}
+
+            {upcoming.length === 0 && (
+              <p className="py-10 text-sm text-[#A7A9B0]">
+                No upcoming releases found.
+              </p>
+            )}
           </div>
         </section>
 
@@ -311,7 +566,7 @@ function App() {
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-[#A7A9B0]" size={19} />
                 <input
                   value={search}
-                  onChange={e => setSearch(e.target.value)}
+                  onChange={(e) => setSearch(e.target.value)}
                   placeholder="Search the collection..."
                   className="w-full border border-[#45474E] bg-[#101114] py-4 pl-12 pr-4 text-sm text-[#F0F0ED] outline-none placeholder:text-[#777A83] focus:border-[#D7FF64]"
                 />
@@ -322,7 +577,7 @@ function App() {
                   Genre
                 </span>
 
-                {genres.map(g => (
+                {['All Games', ...availableGenres].map((g) => (
                   <button
                     key={g}
                     onClick={() => setGenre(g)}
@@ -342,7 +597,7 @@ function App() {
                   Platform
                 </span>
 
-                {platforms.map(p => (
+                {['All', ...availablePlatforms].map((p) => (
                   <button
                     key={p}
                     onClick={() => setPlatform(p)}
@@ -371,18 +626,24 @@ function App() {
             {/* Game grid */}
             <div className="grid gap-x-6 gap-y-10 sm:grid-cols-2 lg:grid-cols-3">
 
-              {filtered.map(game => (
+              {filtered.map((game) => (
                 <article key={game.id} className="group">
 
                   <button
                     onClick={() => openGame(game)}
                     className="relative block aspect-[16/10] w-full overflow-hidden bg-[#101114] text-left"
                   >
-                    <img
-                      src={game.image}
-                      alt={game.title}
-                      className="h-full w-full object-cover transition duration-700 group-hover:scale-[1.04]"
-                    />
+                    {game.image ? (
+                      <img
+                        src={game.image}
+                        alt={game.title}
+                        className="h-full w-full object-cover transition duration-700 group-hover:scale-[1.04]"
+                      />
+                    ) : (
+                      <div className="flex h-full w-full items-center justify-center bg-[#252830]">
+                        <Gamepad2 size={48} className="text-[#777A83]" />
+                      </div>
+                    )}
 
                     <div className="absolute inset-0 bg-gradient-to-t from-black/65 to-transparent opacity-80" />
 
@@ -390,9 +651,11 @@ function App() {
                       {game.genre}
                     </span>
 
-                    <span className="absolute right-4 top-4 flex items-center gap-1 bg-[#101114]/85 px-3 py-2 text-xs font-bold text-[#D7FF64]">
-                      <Star size={13} fill="currentColor" /> {game.score}
-                    </span>
+                    {game.score !== null && game.score !== undefined && (
+                      <span className="absolute right-4 top-4 flex items-center gap-1 bg-[#101114]/85 px-3 py-2 text-xs font-bold text-[#D7FF64]">
+                        <Star size={13} fill="currentColor" /> {game.score}
+                      </span>
+                    )}
 
                     <span className="absolute bottom-4 right-4 flex h-10 w-10 items-center justify-center bg-[#D7FF64] text-[#101114] opacity-0 transition group-hover:opacity-100">
                       <ArrowUpRight size={20} />
@@ -400,21 +663,16 @@ function App() {
                   </button>
 
                   <div className="pt-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <h3 className="font-[Manrope] text-lg font-bold leading-snug">
-                        {game.title}
-                      </h3>
-                      <span className="shrink-0 text-xs font-bold text-[#D7FF64]">
-                        {game.score}
-                      </span>
-                    </div>
+                    <h3 className="font-[Manrope] text-lg font-bold leading-snug">
+                      {game.title}
+                    </h3>
 
                     <p className="mt-2 text-xs text-[#A7A9B0]">
                       {game.developer}
                     </p>
 
                     <div className="mt-4 flex flex-wrap gap-2">
-                      {game.platforms.map(p => (
+                      {game.platforms.map((p) => (
                         <span key={p} className="border border-[#45474E] px-2 py-1 text-[10px] font-medium text-[#A7A9B0]">
                           {p}
                         </span>
@@ -443,7 +701,9 @@ function App() {
             {filtered.length === 0 && (
               <div className="py-20 text-center">
                 <Search className="mx-auto text-[#777A83]" size={32} />
-                <p className="mt-4 font-[Manrope] text-lg font-bold">No games found</p>
+                <p className="mt-4 font-[Manrope] text-lg font-bold">
+                  No games found
+                </p>
                 <p className="mt-2 text-sm text-[#A7A9B0]">
                   Try another search or change your filters.
                 </p>
@@ -504,15 +764,17 @@ function App() {
         >
           <div
             className="my-auto w-full max-w-3xl overflow-hidden border border-[#45474E] bg-[#191B20]"
-            onClick={e => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
           >
 
-            <div className="relative h-56 sm:h-72">
-              <img
-                src={selected.image}
-                alt={selected.title}
-                className="h-full w-full object-cover"
-              />
+            <div className="relative h-56 bg-[#252830] sm:h-72">
+              {selected.image && (
+                <img
+                  src={selected.image}
+                  alt={selected.title}
+                  className="h-full w-full object-cover"
+                />
+              )}
 
               <div className="absolute inset-0 bg-gradient-to-t from-[#191B20] to-transparent" />
 
@@ -549,24 +811,51 @@ function App() {
               </p>
 
               <div className="flex flex-wrap gap-2">
-                {selected.platforms.map(p => (
+                {selected.platforms.map((p) => (
                   <span key={p} className="border border-[#45474E] px-3 py-2 text-xs text-[#A7A9B0]">
                     {p}
                   </span>
                 ))}
               </div>
 
+              {selected.website && (
+                <a
+                  href={selected.website}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-2 text-sm font-bold text-[#D7FF64] hover:text-white"
+                >
+                  Official website <ArrowUpRight size={16} />
+                </a>
+              )}
+
+              {selected.score !== null && selected.score !== undefined && (
+                <div className="flex items-center justify-between border-y border-[#45474E] py-5">
+                  <div>
+                    <p className="text-sm font-bold">Metacritic score</p>
+                    <p className="mt-1 text-xs text-[#A7A9B0]">
+                      Score provided by Steam game information.
+                    </p>
+                  </div>
+
+                  <span className="font-[Manrope] text-3xl font-extrabold tabular-nums text-[#D7FF64]">
+                    {selected.score}
+                  </span>
+                </div>
+              )}
+
+              {/* Personal excitement slider */}
               <div className="border-y border-[#45474E] py-6">
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <p className="text-sm font-bold">Your excitement score</p>
                     <p className="mt-1 text-xs text-[#A7A9B0]">
-                      Adjust your interest in this game.
+                      How interested are you in this game?
                     </p>
                   </div>
 
                   <span className="font-[Manrope] text-3xl font-extrabold tabular-nums text-[#D7FF64]">
-                    {communityScore}/100
+                    {review}/100
                   </span>
                 </div>
 
@@ -575,7 +864,7 @@ function App() {
                   min="0"
                   max="100"
                   value={review}
-                  onChange={e => setReview(Number(e.target.value))}
+                  onChange={(e) => setReview(Number(e.target.value))}
                   className="mt-6 w-full accent-[#D7FF64]"
                 />
 
@@ -585,8 +874,7 @@ function App() {
                 </div>
 
                 <p className="mt-4 text-[10px] leading-5 text-[#777A83]">
-                  Demo score calculated from the sample game score and your slider.
-                  This is not a real community rating.
+                  This is your personal interest score. It is not a community rating.
                 </p>
               </div>
 
@@ -601,7 +889,9 @@ function App() {
               {trailer && (
                 <div className="border border-[#45474E] bg-[#101114] p-6 text-center">
                   <Play className="mx-auto text-[#D7FF64]" size={28} />
-                  <p className="mt-3 text-sm font-semibold">Trailer preview</p>
+                  <p className="mt-3 text-sm font-semibold">
+                    Trailer preview
+                  </p>
                   <p className="mt-2 text-xs leading-6 text-[#A7A9B0]">
                     This is a placeholder. An official YouTube trailer URL
                     can be connected here.
