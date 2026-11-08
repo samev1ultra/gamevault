@@ -1,5 +1,5 @@
 
-const GAME_GENRES = [
+const GENRES = [
   'Action',
   'Adventure',
   'Strategy',
@@ -12,11 +12,27 @@ const GAME_GENRES = [
   'Sports',
 ]
 
-const delay = (ms) =>
-  new Promise((resolve) => setTimeout(resolve, ms))
+const searchCache = new Map()
+const detailsCache = new Map()
+const discoveryCache = new Map()
 
-async function fetchSteamJSON(url) {
-  const response = await fetch(url)
+const pendingSearches = new Map()
+const pendingDetails = new Map()
+const pendingDiscoveries = new Map()
+
+const CACHE_TTL = 5 * 60 * 1000
+const DETAILS_CACHE_TTL = 30 * 60 * 1000
+const DISCOVERY_CACHE_TTL = 15 * 60 * 1000
+const GENRE_CACHE_TTL = 60 * 60 * 1000
+const MAX_CONCURRENT_REQUESTS = 5
+
+let genreCache = null
+
+async function fetchJSON(url) {
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'GameVault/1.0' },
+    signal: AbortSignal.timeout(15000),
+  })
 
   if (!response.ok) {
     throw new Error(`Steam returned HTTP ${response.status}`)
@@ -25,212 +41,373 @@ async function fetchSteamJSON(url) {
   return response.json()
 }
 
-// Convert Steam game details into database values
-function getGameMetadata(game) {
-  const genres = (game.genres || [])
-    .map((genre) => genre.description)
-    .filter(Boolean)
+function cachedGet(cache, key, ttl = CACHE_TTL) {
+  const entry = cache.get(key)
 
+  if (!entry || Date.now() - entry.time > ttl) {
+    cache.delete(key)
+    return null
+  }
+
+  return entry.value
+}
+
+function cachedSet(cache, key, value) {
+  cache.set(key, {
+    value,
+    time: Date.now(),
+  })
+
+  return value
+}
+
+async function getGenreList() {
+  if (genreCache && Date.now() - genreCache.time < GENRE_CACHE_TTL) {
+    return genreCache.value
+  }
+
+  const data = await fetchJSON(
+    'https://store.steampowered.com/api/getgenrelist/?cc=us&l=en'
+  )
+
+  if (data.status !== 1 || !Array.isArray(data.genres)) {
+    throw new Error('Steam genre catalogue is temporarily unavailable.')
+  }
+
+  genreCache = {
+    value: data.genres,
+    time: Date.now(),
+  }
+
+  return data.genres
+}
+
+function normalizeSteamGame(game, appid) {
   const platforms = []
 
-  if (game.platforms?.windows) platforms.push('Windows')
+  if (game.platforms?.windows) platforms.push('PC')
   if (game.platforms?.mac) platforms.push('Mac')
   if (game.platforms?.linux) platforms.push('Linux')
 
   const score = Number(game.metacritic?.score)
 
+  const price = game.is_free
+    ? 'Free to Play'
+    : game.price_overview?.final_formatted || 'Price unavailable'
+
+  const movies = (game.movies || [])
+    .map((movie) => ({
+      name: movie.name || 'Official trailer',
+      thumbnail: movie.thumbnail || '',
+      mp4: movie.mp4?.max || movie.mp4?.['480'] || '',
+      webm: movie.webm?.max || movie.webm?.['480'] || '',
+    }))
+    .filter((movie) => movie.mp4 || movie.webm)
+
   return {
-    genres: JSON.stringify(genres),
-    platforms: JSON.stringify(platforms),
-    metacriticScore: Number.isInteger(score) ? score : null,
+    appid: Number(appid),
+    title: game.name || 'Untitled game',
+    description: game.short_description || game.about_the_game || '',
+    developer: (game.developers || []).join(', ') || 'Unknown developer',
+    publisher: (game.publishers || []).join(', '),
+    date: game.release_date?.date || '',
+    releaseDate: game.release_date?.date || '',
+    comingSoon: Boolean(game.release_date?.coming_soon),
+    image: game.header_image || '',
+    background: game.background || '',
+    website: game.website || '',
+    genres: (game.genres || [])
+      .map((item) => item.description)
+      .filter(Boolean),
+    platforms,
+    score: Number.isInteger(score) ? score : null,
+    price,
+    isFree: Boolean(game.is_free),
+    storeUrl: `https://store.steampowered.com/app/${appid}/`,
+    movies,
+    screenshots: (game.screenshots || [])
+      .map((item) => item.path_full)
+      .filter(Boolean),
+    type: game.type,
   }
 }
 
-async function discoverAndImport(db, options = {}) {
-  const requestedGenres = options.genres || ['Action', 'Adventure']
+async function searchSteamGames(query) {
+  const cleanQuery = String(query || '').trim()
 
-  const limitPerCategory = Math.min(
-    Math.max(Number(options.limitPerCategory) || 1, 1),
+  if (cleanQuery.length < 2) return []
+
+  const cacheKey = cleanQuery.toLowerCase()
+
+  const cached = cachedGet(searchCache, cacheKey)
+
+  if (cached !== null) return cached
+
+  if (pendingSearches.has(cacheKey)) {
+    return pendingSearches.get(cacheKey)
+  }
+
+  const request = (async () => {
+    const url =
+      'https://store.steampowered.com/api/storesearch/' +
+      `?term=${encodeURIComponent(cleanQuery)}&cc=us&l=en`
+
+    const data = await fetchJSON(url)
+
+    const results = (data.items || [])
+      .filter((item) => item.type === 'app')
+      .slice(0, 10)
+      .map((item) => ({
+        appid: Number(item.id),
+        title: item.name,
+        image: item.tiny_image || '',
+        price: item.price?.final_formatted || 'Price unavailable',
+        platforms: item.platforms || {},
+        storeUrl: `https://store.steampowered.com/app/${item.id}/`,
+      }))
+
+    return cachedSet(searchCache, cacheKey, results)
+  })()
+
+  pendingSearches.set(cacheKey, request)
+
+  try {
+    return await request
+  } finally {
+    pendingSearches.delete(cacheKey)
+  }
+}
+
+async function getSteamGameDetails(appid) {
+  const id = Number(appid)
+
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new Error('Invalid Steam AppID.')
+  }
+
+  const key = String(id)
+
+  const cached = cachedGet(detailsCache, key, DETAILS_CACHE_TTL)
+
+  if (cached !== null) return cached
+
+  if (pendingDetails.has(key)) {
+    return pendingDetails.get(key)
+  }
+
+  const request = (async () => {
+    const url =
+      'https://store.steampowered.com/api/appdetails/' +
+      `?appids=${id}&cc=us&l=en`
+
+    const result = await fetchJSON(url)
+    const item = result[id]
+
+    if (!item?.success || !item.data) {
+      const error = new Error('Steam could not find this product.')
+      error.status = 404
+      throw error
+    }
+
+    if (item.data.type !== 'game') {
+      const error = new Error('This Steam listing is not a game.')
+      error.status = 422
+      throw error
+    }
+
+    return cachedSet(
+      detailsCache,
+      key,
+      normalizeSteamGame(item.data, id)
+    )
+  })()
+
+  pendingDetails.set(key, request)
+
+  try {
+    return await request
+  } finally {
+    pendingDetails.delete(key)
+  }
+}
+
+async function mapWithConcurrency(items, limit, callback) {
+  const results = new Array(items.length)
+  let nextIndex = 0
+
+  async function worker() {
+    while (true) {
+      const index = nextIndex++
+
+      if (index >= items.length) return
+
+      try {
+        results[index] = await callback(items[index])
+      } catch (error) {
+        results[index] = {
+          error: error.message,
+        }
+      }
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length)
+
+  await Promise.all(
+    Array.from({ length: workerCount }, () => worker())
+  )
+
+  return results
+}
+
+async function discoverSteamGames(options = {}) {
+  const requested = Array.isArray(options.genres)
+    ? options.genres
+    : ['Action', 'Adventure']
+
+  const genres = [...new Set(
+    requested.filter((genre) => GENRES.includes(genre))
+  )].sort()
+
+  const limit = Math.min(
+    Math.max(Number(options.limit) || 3, 1),
     10
   )
 
-  const genres = requestedGenres.filter((genre) =>
-    GAME_GENRES.includes(genre)
-  )
-
-  if (genres.length === 0) {
-    throw new Error('No valid game genres were selected.')
+  if (!genres.length) {
+    throw new Error('Select at least one valid genre.')
   }
 
-  console.log('Starting Steam game discovery...')
+  const cacheKey = `${genres.join(',')}|${limit}`
 
-  // Step 1: Get Steam's genre list
-  const genreData = await fetchSteamJSON(
-    'https://store.steampowered.com/api/getgenrelist/?cc=us&l=en'
+  const cached = cachedGet(
+    discoveryCache,
+    cacheKey,
+    DISCOVERY_CACHE_TTL
   )
 
-  if (genreData.status !== 1 || !Array.isArray(genreData.genres)) {
-    throw new Error('Could not retrieve Steam genres.')
+  if (cached !== null) return cached
+
+  if (pendingDiscoveries.has(cacheKey)) {
+    return pendingDiscoveries.get(cacheKey)
   }
 
-  const availableGenres = new Set(
-    genreData.genres.map((genre) => genre.id)
-  )
+  const request = (async () => {
+    const genreData = await getGenreList()
 
-  const validGenres = genres.filter((genre) =>
-    availableGenres.has(genre)
-  )
+    const available = new Set(
+      genreData.map((item) => item.id)
+    )
 
-  // Step 2: Discover AppIDs
-  const appIds = new Set()
-  const discoveryErrors = []
+    const validGenres = genres.filter((genre) =>
+      available.has(genre)
+    )
 
-  for (const genre of validGenres) {
-    console.log(`Checking genre: ${genre}`)
+    const errors = []
 
-    try {
-      const url =
-        `https://store.steampowered.com/api/getappsingenre/` +
-        `?genre=${encodeURIComponent(genre)}&cc=us&l=en`
+    const genreResults = await Promise.all(
+      validGenres.map(async (genre) => {
+        try {
+          const url =
+            'https://store.steampowered.com/api/getappsingenre/' +
+            `?genre=${encodeURIComponent(genre)}&cc=us&l=en`
 
-      const data = await fetchSteamJSON(url)
+          const data = await fetchJSON(url)
 
-      if (data.status !== 1 || !data.tabs) {
-        throw new Error('Unexpected genre response.')
-      }
+          if (data.status !== 1 || !data.tabs) {
+            throw new Error('Unexpected Steam genre response.')
+          }
 
-      const categories = ['comingsoon', 'newreleases']
+          return {
+            genre,
+            items: [
+              ...(data.tabs.comingsoon?.items || []).slice(0, limit),
+              ...(data.tabs.newreleases?.items || []).slice(0, limit),
+            ],
+          }
+        } catch (error) {
+          errors.push({
+            genre,
+            error: error.message,
+          })
 
-      for (const category of categories) {
-        const items = data.tabs[category]?.items || []
+          return {
+            genre,
+            items: [],
+          }
+        }
+      })
+    )
 
-        const gameItems = items
-          .filter((item) => item.type === 0 && item.id)
-          .slice(0, limitPerCategory)
+    const appIds = new Set()
 
-        for (const item of gameItems) {
+    for (const result of genreResults) {
+      for (const item of result.items) {
+        if (item.type === 0 && item.id) {
           appIds.add(Number(item.id))
         }
       }
-    } catch (error) {
-      console.error(`Failed to check ${genre}:`, error.message)
-
-      discoveryErrors.push({
-        genre,
-        error: error.message,
-      })
     }
 
-    await delay(300)
-  }
+    const ids = [...appIds]
 
-  // Step 3: Prepare database insert/update
-  const saveGame = db.prepare(`
-    INSERT INTO games (
-      appid,
-      title,
-      description,
-      developer,
-      publisher,
-      release_date,
-      image,
-      website,
-      genres,
-      platforms,
-      metacritic_score
+    const detailResults = await mapWithConcurrency(
+      ids,
+      MAX_CONCURRENT_REQUESTS,
+      (appid) => getSteamGameDetails(appid)
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
-    ON CONFLICT(appid) DO UPDATE SET
-      title = excluded.title,
-      description = excluded.description,
-      developer = excluded.developer,
-      publisher = excluded.publisher,
-      release_date = excluded.release_date,
-      image = excluded.image,
-      website = excluded.website,
-      genres = excluded.genres,
-      platforms = excluded.platforms,
-      metacritic_score = excluded.metacritic_score,
-      updated_at = CURRENT_TIMESTAMP
-  `)
+    const games = []
+    let skipped = 0
 
-  // Step 4: Fetch details and save each discovered game
-  let imported = 0
-  let failed = 0
-  let skipped = 0
-
-  const importErrors = []
-
-  for (const appid of appIds) {
-    try {
-      const url =
-        `https://store.steampowered.com/api/appdetails/` +
-        `?appids=${appid}&cc=us&l=en`
-
-      const result = await fetchSteamJSON(url)
-      const gameData = result[appid]
-
-      if (!gameData || !gameData.success || !gameData.data) {
+    for (const result of detailResults) {
+      if (result && !result.error) {
+        games.push(result)
+      } else {
         skipped++
-        continue
       }
-
-      const game = gameData.data
-
-      if (game.type !== 'game' || !game.name) {
-        skipped++
-        continue
-      }
-
-      const metadata = getGameMetadata(game)
-
-      saveGame.run(
-        appid,
-        game.name,
-        game.short_description || '',
-        (game.developers || []).join(', '),
-        (game.publishers || []).join(', '),
-        game.release_date?.date || '',
-        game.header_image || '',
-        game.website || '',
-        metadata.genres,
-        metadata.platforms,
-        metadata.metacriticScore
-      )
-
-      imported++
-
-      console.log(`Saved: ${game.name}`)
-    } catch (error) {
-      failed++
-
-      console.error(`Failed AppID ${appid}:`, error.message)
-
-      importErrors.push({
-        appid,
-        error: error.message,
-      })
     }
 
-    // Keep requests spaced out
-    await delay(400)
-  }
+    games.sort((a, b) => {
+      if (a.comingSoon !== b.comingSoon) {
+        return a.comingSoon ? -1 : 1
+      }
 
-  console.log('Steam discovery finished.')
+      const da = Date.parse(a.date) || Number.MAX_SAFE_INTEGER
+      const db = Date.parse(b.date) || Number.MAX_SAFE_INTEGER
 
-  return {
-    message: 'Steam discovery completed.',
-    genresChecked: validGenres,
-    discovered: appIds.size,
-    imported,
-    skipped,
-    failed,
-    discoveryErrors,
-    importErrors,
+      return da - db
+    })
+
+    const discoveryResult = {
+      games,
+      discovered: appIds.size,
+      returned: games.length,
+      skipped,
+      genresChecked: validGenres,
+      errors,
+      refreshedAt: new Date().toISOString(),
+    }
+
+    return cachedSet(
+      discoveryCache,
+      cacheKey,
+      discoveryResult
+    )
+  })()
+
+  pendingDiscoveries.set(cacheKey, request)
+
+  try {
+    return await request
+  } finally {
+    pendingDiscoveries.delete(cacheKey)
   }
 }
 
 module.exports = {
-  discoverAndImport,
+  GENRES,
+  searchSteamGames,
+  getSteamGameDetails,
+  discoverSteamGames,
 }

@@ -1,190 +1,118 @@
-
 const express = require('express')
 const cors = require('cors')
 const db = require('./database')
-const { discoverAndImport } = require('./steam')
+const { GENRES, searchSteamGames, getSteamGameDetails, discoverSteamGames } = require('./steam')
 
 const app = express()
-const PORT = 3001
+const PORT = process.env.PORT || 3001
+const USER_ID = 'local'
 
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '32kb' }))
 
-// Check server status
-app.get('/', (req, res) => {
-  res.json({
-    message: 'GameVault API is running!',
-    status: 'success',
-  })
-})
+app.get('/', (req, res) => res.json({ message: 'GameVault API is running!', status: 'success' }))
+app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'GameVault API' }))
 
-// Get all imported games
-app.get('/api/games', (req, res) => {
+// Live Steam autocomplete/search. Search results are never written to SQLite.
+app.get('/api/search', async (req, res) => {
   try {
-    const games = db
-      .prepare('SELECT * FROM games ORDER BY created_at DESC')
-      .all()
-
-    res.json({
-      total: games.length,
-      games,
-    })
+    const query = String(req.query.q || '').trim().slice(0, 100)
+    if (query.length < 2) return res.json({ games: [], total: 0, source: 'steam' })
+    const games = await searchSteamGames(query)
+    res.set('Cache-Control', 'no-store')
+    res.json({ games, total: games.length, source: 'steam' })
   } catch (error) {
-    console.error('Database error:', error)
-
-    res.status(500).json({
-      error: 'Failed to retrieve games',
-    })
+    console.error('Search error:', error)
+    res.status(502).json({ error: 'Steam search is temporarily unavailable.' })
   }
 })
 
-// Automatically discover and import games from Steam
-// Keep this route before /api/import/:appid
-app.post('/api/import/discover', async (req, res) => {
+// Fetch full details only when a user opens a game.
+app.get('/api/steam/games/:appid', async (req, res) => {
   try {
-    const genres = req.query.genres
-      ? req.query.genres.split(',').map((genre) => genre.trim())
-      : ['Action', 'Adventure']
+    const appid = String(req.params.appid)
+    if (!/^\d{1,12}$/.test(appid)) return res.status(400).json({ error: 'A valid Steam AppID is required.' })
+    const game = await getSteamGameDetails(appid)
+    res.json({ game })
+  } catch (error) {
+    console.error('Game details error:', error)
+    res.status(error.status || 502).json({ error: error.message || 'Could not retrieve game details.' })
+  }
+})
 
-    const limitPerCategory = Number(req.query.limit) || 1
-
-    const result = await discoverAndImport(db, {
-      genres,
-      limitPerCategory,
-    })
-
+// One request per genre lets the frontend display each completed batch progressively.
+// Discovery results are temporary; only explicit personal-library actions are persisted.
+app.get('/api/discover', async (req, res) => {
+  try {
+    const genres = [...new Set(String(req.query.genres || 'Action,Adventure').split(',').map((item) => item.trim()).filter(Boolean))]
+    const invalidGenres = genres.filter((genre) => !GENRES.includes(genre))
+    if (!genres.length || invalidGenres.length) {
+      return res.status(400).json({ error: invalidGenres.length ? `Unsupported genre: ${invalidGenres.join(', ')}` : 'Choose at least one genre.', allowedGenres: GENRES })
+    }
+    const limit = Number(req.query.limit ?? 3)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10) {
+      return res.status(400).json({ error: 'Limit must be a whole number from 1 to 10.' })
+    }
+    const result = await discoverSteamGames({ genres, limit })
+    res.set('Cache-Control', 'no-store')
     res.json(result)
   } catch (error) {
     console.error('Discovery error:', error)
-
-    res.status(500).json({
-      error: 'Steam discovery failed',
-      details: error.message,
-    })
+    res.status(502).json({ error: error.message || 'Steam discovery failed.' })
   }
 })
 
-// Manually import one game using its Steam AppID
-app.post('/api/import/:appid', async (req, res) => {
+// Saved actions are loaded from SQLite; game metadata is refreshed from Steam.
+app.get('/api/actions', async (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT appid, source, action, created_at FROM user_game_actions WHERE user_id = ? ORDER BY created_at DESC`).all(USER_ID)
+    const saved = await Promise.all(rows.map(async (row) => {
+      try {
+        const game = row.source === 'steam' ? await getSteamGameDetails(row.appid) : null
+        return { ...row, game }
+      } catch {
+        return { ...row, game: null }
+      }
+    }))
+    res.json({ saved })
+  } catch (error) {
+    console.error('Saved actions error:', error)
+    res.status(500).json({ error: 'Could not load saved games.' })
+  }
+})
+
+// Persist only a deliberate user action: favourite, vault, or wishlist.
+app.post('/api/actions', (req, res) => {
+  try {
+    const appid = Number(req.body.appid)
+    const source = String(req.body.source || 'steam')
+    const action = String(req.body.action || '')
+    if (!Number.isSafeInteger(appid) || appid <= 0) return res.status(400).json({ error: 'A valid AppID is required.' })
+    if (source !== 'steam') return res.status(400).json({ error: 'Unsupported game source.' })
+    if (!['favorite', 'vault', 'wishlist'].includes(action)) return res.status(400).json({ error: 'Invalid save action.' })
+    db.prepare(`INSERT INTO user_game_actions (user_id, appid, source, action) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, appid, source, action) DO NOTHING`).run(USER_ID, appid, source, action)
+    res.json({ success: true, appid, source, action })
+  } catch (error) {
+    console.error('Save action error:', error)
+    res.status(500).json({ error: 'Could not save this game.' })
+  }
+})
+
+// Remove one action without affecting the other saved actions for that game.
+app.delete('/api/actions/:appid/:action', (req, res) => {
   try {
     const appid = Number(req.params.appid)
-
-    if (!Number.isSafeInteger(appid) || appid <= 0) {
-      return res.status(400).json({
-        error: 'Invalid Steam AppID',
-      })
+    const action = String(req.params.action)
+    if (!Number.isSafeInteger(appid) || appid <= 0 || !['favorite', 'vault', 'wishlist'].includes(action)) {
+      return res.status(400).json({ error: 'Invalid saved-game action.' })
     }
-
-    const response = await fetch(
-      `https://store.steampowered.com/api/appdetails?appids=${appid}&cc=us&l=en`
-    )
-
-    if (!response.ok) {
-      return res.status(502).json({
-        error: 'Steam API request failed',
-      })
-    }
-
-    const result = await response.json()
-    const gameData = result[appid]
-
-    if (!gameData || !gameData.success || !gameData.data) {
-      return res.status(404).json({
-        error: 'Game not found on Steam',
-      })
-    }
-
-    const game = gameData.data
-
-    if (game.type !== 'game') {
-      return res.status(400).json({
-        error: 'This Steam AppID is not a game',
-      })
-    }
-
-    // Extract actual Steam genres
-    const genres = (game.genres || [])
-      .map((genre) => genre.description)
-      .filter(Boolean)
-
-    // Extract supported platforms
-    const platforms = []
-
-    if (game.platforms?.windows) platforms.push('Windows')
-    if (game.platforms?.mac) platforms.push('Mac')
-    if (game.platforms?.linux) platforms.push('Linux')
-
-    // Extract Metacritic score when available
-    const score = Number(game.metacritic?.score)
-
-    const metacriticScore = Number.isInteger(score)
-      ? score
-      : null
-
-    const statement = db.prepare(`
-      INSERT INTO games (
-        appid,
-        title,
-        description,
-        developer,
-        publisher,
-        release_date,
-        image,
-        website,
-        genres,
-        platforms,
-        metacritic_score
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
-      ON CONFLICT(appid) DO UPDATE SET
-        title = excluded.title,
-        description = excluded.description,
-        developer = excluded.developer,
-        publisher = excluded.publisher,
-        release_date = excluded.release_date,
-        image = excluded.image,
-        website = excluded.website,
-        genres = excluded.genres,
-        platforms = excluded.platforms,
-        metacritic_score = excluded.metacritic_score,
-        updated_at = CURRENT_TIMESTAMP
-    `)
-
-    statement.run(
-      appid,
-      game.name,
-      game.short_description || '',
-      (game.developers || []).join(', '),
-      (game.publishers || []).join(', '),
-      game.release_date?.date || '',
-      game.header_image || '',
-      game.website || '',
-      JSON.stringify(genres),
-      JSON.stringify(platforms),
-      metacriticScore
-    )
-
-    res.json({
-      message: 'Game imported successfully!',
-      game: {
-        appid,
-        title: game.name,
-        genres,
-        platforms,
-        metacriticScore,
-      },
-    })
+    db.prepare(`DELETE FROM user_game_actions WHERE user_id = ? AND appid = ? AND source = 'steam' AND action = ?`).run(USER_ID, appid, action)
+    res.json({ success: true, appid, action, removed: true })
   } catch (error) {
-    console.error('Import error:', error)
-
-    res.status(500).json({
-      error: 'Failed to import game',
-      details: error.message,
-    })
+    console.error('Remove action error:', error)
+    res.status(500).json({ error: 'Could not remove this saved action.' })
   }
 })
 
-app.listen(PORT, () => {
-  console.log(`GameVault server running at http://localhost:${PORT}`)
-})
+app.get('/api/genres', (req, res) => res.json({ genres: GENRES }))
+app.listen(PORT, () => console.log(`GameVault server running at http://localhost:${PORT}`))
